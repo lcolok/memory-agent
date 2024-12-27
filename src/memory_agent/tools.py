@@ -16,7 +16,7 @@ async def upsert_memory(
     *,
     memory_id: Optional[uuid.UUID] = None,
     # Hide these arguments from the model.
-    config: Annotated[RunnableConfig, InjectedToolArg],
+    config: Annotated[dict, InjectedToolArg],
     store: Annotated[BaseStore, InjectedToolArg],
 ):
     """Upsert a memory in the database.
@@ -34,7 +34,7 @@ async def upsert_memory(
         The memory to overwrite.
     """
     mem_id = memory_id or uuid.uuid4()
-    user_id = Configuration.from_runnable_config(config).user_id
+    user_id = config["configurable"]["user_id"]
     await store.aput(
         ("memories", user_id),
         key=str(mem_id),

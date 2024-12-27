@@ -1,31 +1,46 @@
 """Graphs that extract memories on a schedule."""
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 
-from langchain.chat_models import init_chat_model
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 from langgraph.store.base import BaseStore
 
 from memory_agent import configuration, tools, utils
 from memory_agent.state import State
+from langchain_core.messages import SystemMessage
 
 logger = logging.getLogger(__name__)
-
-# Initialize the language model to be used for memory extraction
-llm = init_chat_model()
 
 
 async def call_model(state: State, config: RunnableConfig, *, store: BaseStore) -> dict:
     """Extract the user's state from the conversation and update the memory."""
-    configurable = configuration.Configuration.from_runnable_config(config)
+    # 过滤掉不需要的配置参数
+    config_dict = config["configurable"]
+    filtered_config = {
+        k: v for k, v in config_dict.items()
+        if k in ["user_id", "model", "embedding_model", "system_prompt"]
+    }
+    configurable = configuration.Configuration(**filtered_config)
+
+    # Initialize the models based on configuration
+    model_config = utils.split_model_and_provider(configurable.model)
+    llm = utils.initialize_chat_model(model_config)
+    embeddings = utils.initialize_embedding_model(configurable.embedding_model)
+
+    # Get the query text from recent messages
+    query = str([m.content for m in state.messages[-3:]])
+
+    # Calculate embeddings for the query
+    query_embedding = await embeddings.aembed_query(query)
 
     # Retrieve the most recent memories for context
-    memories = await store.asearch(
+    memories = store.search(
         ("memories", configurable.user_id),
-        query=str([m.content for m in state.messages[-3:]]),
+        query=query_embedding,
         limit=10,
     )
 
@@ -38,24 +53,38 @@ async def call_model(state: State, config: RunnableConfig, *, store: BaseStore) 
 </memories>"""
 
     # Prepare the system prompt with user memories and current time
-    # This helps the model understand the context and temporal relevance
     sys = configurable.system_prompt.format(
         user_info=formatted, time=datetime.now().isoformat()
     )
 
     # Invoke the language model with the prepared prompt and tools
-    # "bind_tools" gives the LLM the JSON schema for all tools in the list so it knows how
-    # to use them.
     msg = await llm.bind_tools([tools.upsert_memory]).ainvoke(
-        [{"role": "system", "content": sys}, *state.messages],
-        {"configurable": utils.split_model_and_provider(configurable.model)},
+        [SystemMessage(content=sys), *state.messages],
+        {"configurable": model_config},
     )
+
+    # 修复工具调用参数的格式
+    if "tool_calls" in msg.additional_kwargs:
+        for tc in msg.additional_kwargs["tool_calls"]:
+            if tc["type"] == "function":
+                tc["args"] = json.loads(tc["function"]["arguments"])
+
     return {"messages": [msg]}
 
 
 async def store_memory(state: State, config: RunnableConfig, *, store: BaseStore):
     # Extract tool calls from the last message
-    tool_calls = state.messages[-1].tool_calls
+    tool_calls = []
+    for tc in state.messages[-1].additional_kwargs.get("tool_calls", []):
+        if tc["type"] == "function" and tc["function"]["name"] == "upsert_memory":
+            args = tc["args"]  # 不需要再次解析 JSON
+            tool_calls.append({
+                "id": tc["id"],
+                "args": {
+                    "content": args.get("content", args.get("value")),  # 兼容 value 字段
+                    "context": args.get("key", args.get("context", "No context provided"))  # 兼容 key 字段
+                }
+            })
 
     # Concurrently execute all upsert_memory calls
     saved_memories = await asyncio.gather(
@@ -80,28 +109,25 @@ async def store_memory(state: State, config: RunnableConfig, *, store: BaseStore
 
 def route_message(state: State):
     """Determine the next step based on the presence of tool calls."""
-    msg = state.messages[-1]
-    if msg.tool_calls:
-        # If there are tool calls, we need to store memories
+    # Check if the last message has any tool calls
+    if state.messages[-1].additional_kwargs.get("tool_calls"):
         return "store_memory"
-    # Otherwise, finish; user can send the next message
     return END
 
 
 # Create the graph + all nodes
 builder = StateGraph(State, config_schema=configuration.Configuration)
 
-# Define the flow of the memory extraction process
-builder.add_node(call_model)
-builder.add_edge("__start__", "call_model")
-builder.add_node(store_memory)
-builder.add_conditional_edges("call_model", route_message, ["store_memory", END])
-# Right now, we're returning control to the user after storing a memory
-# Depending on the model, you may want to route back to the model
-# to let it first store memories, then generate a response
-builder.add_edge("store_memory", "call_model")
+# Add the nodes
+builder.add_node("call_model", call_model)
+builder.add_node("store_memory", store_memory)
+
+# Add the edges
+builder.set_entry_point("call_model")
+builder.add_conditional_edges("call_model", route_message)
+builder.add_edge("store_memory", END)
+
 graph = builder.compile()
 graph.name = "MemoryAgent"
-
 
 __all__ = ["graph"]

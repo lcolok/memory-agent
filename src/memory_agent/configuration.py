@@ -1,8 +1,8 @@
 """Define the configurable parameters for the agent."""
 
 import os
-from dataclasses import dataclass, field, fields
-from typing import Any, Optional
+from dataclasses import dataclass, field, fields, asdict
+from typing import Any, Optional, Iterator, Tuple
 
 from langchain_core.runnables import RunnableConfig
 from typing_extensions import Annotated
@@ -17,12 +17,14 @@ class Configuration:
     user_id: str = "default"
     """The ID of the user to remember in the conversation."""
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="anthropic/claude-3-5-sonnet-20240620",
+        default="siliconflow/Qwen/Qwen2.5-72B-Instruct",
         metadata={
             "description": "The name of the language model to use for the agent. "
             "Should be in the form: provider/model-name."
         },
     )
+    embedding_model: str = "netease-youdao/bce-embedding-base_v1"
+    """The embedding model to use for semantic search."""
     system_prompt: str = prompts.SYSTEM_PROMPT
 
     @classmethod
@@ -40,3 +42,7 @@ class Configuration:
         }
 
         return cls(**{k: v for k, v in values.items() if v})
+
+    def items(self) -> Iterator[Tuple[str, dict]]:
+        """Convert the configuration to a dictionary."""
+        yield "configurable", asdict(self)
